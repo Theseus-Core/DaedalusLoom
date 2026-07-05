@@ -11,12 +11,13 @@ extern "C" {
 
 typedef struct {
     int class_id;
+    int class_count;
     const char *class_name;
     float confidence;
     bool is_realtime; // true 代表每帧实时预测，false 代表动作结束的最终判定结果
     
     // 最终判决时的概率与帧统计
-    float final_probs[NUM_CLASSES];
+    float final_probs[NN_MODEL_MAX_CLASS_COUNT];
     int gesture_frames_count;
     float total_weight;
 } gesture_result_t;

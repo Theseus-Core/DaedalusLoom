@@ -76,7 +76,7 @@ static void console_log_observer(const gesture_result_t *result, void *user_data
     } else {
         ESP_LOGI(TAG, "================ GESTURE DETECTED ================");
         ESP_LOGI(TAG, "🏆🏆🏆 Final Result: %s (Score: %.1f%%)", result->class_name, result->confidence * 100.0f);
-        for (int c = 0; c < NUM_CLASSES; c++) {
+        for (int c = 0; c < result->class_count; c++) {
             const char *name = nn_model_get_class_name(c);
             ESP_LOGI(TAG, "      - Class %d (%s) Prob: %.2f%%", c, name, result->final_probs[c] * 100.0f);
         }
@@ -100,7 +100,7 @@ static void ai_inference_task(void *pvParameters)
     gesture_detector_t detector;
     gesture_detector_init(&detector);
     
-    float probs[NUM_CLASSES] = {0.0f};
+    float probs[NN_MODEL_MAX_CLASS_COUNT] = {0.0f};
     inference_job_t job;
     
     while (1) {
@@ -109,11 +109,12 @@ static void ai_inference_task(void *pvParameters)
                 // 动作结束，进行加权总决策
                 int final_class = 0;
                 float final_prob = 0.0f;
-                float final_probs[NUM_CLASSES] = {0.0f};
+                float final_probs[NN_MODEL_MAX_CLASS_COUNT] = {0.0f};
                 
                 if (gesture_detector_get_final(&detector, &final_class, &final_prob, final_probs)) {
                     gesture_result_t result = {
                         .class_id = final_class,
+                        .class_count = nn_model_get_class_count(),
                         .class_name = nn_model_get_class_name(final_class),
                         .confidence = final_prob,
                         .is_realtime = false,
@@ -133,8 +134,12 @@ static void ai_inference_task(void *pvParameters)
             } else {
                 // 执行 AI 推理并测量时间
                 int64_t start = esp_timer_get_time();
+                memset(probs, 0, sizeof(probs));
                 int pred_class = nn_model_predict_cnn_with_probs(job.buffer, probs);
                 int64_t end = esp_timer_get_time();
+                (void)start;
+                (void)end;
+                (void)pred_class;
                 
                 // 立即将使用的缓冲区归还到空闲队列，缩短被占用的时间
                 float *buf_ptr = job.buffer;
@@ -150,6 +155,7 @@ static void ai_inference_task(void *pvParameters)
                 // 实时分发推理结果
                 gesture_result_t result = {
                     .class_id = smoothed_class,
+                    .class_count = nn_model_get_class_count(),
                     .class_name = nn_model_get_class_name(smoothed_class),
                     .confidence = confidence,
                     .is_realtime = true

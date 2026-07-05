@@ -12,8 +12,9 @@ extern "C" {
 #define GESTURE_SMOOTHING_FRAMES 7
 
 typedef struct {
-    float accumulated_probs[NUM_CLASSES];
-    float unweighted_probs[NUM_CLASSES];
+    float accumulated_probs[NN_MODEL_MAX_CLASS_COUNT];
+    float unweighted_probs[NN_MODEL_MAX_CLASS_COUNT];
+    int class_count;
     float total_weight;
     int gesture_frames_count;
     
@@ -54,7 +55,7 @@ void gesture_detector_accumulate(gesture_detector_t *detector,
  * @param detector 检测器指针
  * @param out_final_class 输出判决结果类别
  * @param out_final_prob 输出判决结果的加权概率值
- * @param out_probs 输出所有类别的加权后概率数组 (大小需为 NUM_CLASSES，可传 NULL)
+ * @param out_probs 输出所有类别的加权后概率数组 (大小需为 NN_MODEL_MAX_CLASS_COUNT，可传 NULL)
  * @return true 判决成功（有高置信度帧积累）
  * @return false 判决失败（无积累帧）
  */

@@ -3,6 +3,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nn_model.h"
 
 #define MOTION_THRESHOLD_MIN_X10 10
 #define MOTION_THRESHOLD_MAX_X10 100
@@ -13,7 +14,7 @@
 #define DEBOUNCE_MIN_FRAMES 1
 #define DEBOUNCE_MAX_FRAMES 50
 #define MODEL_ID_MIN 0
-#define MODEL_ID_MAX 1
+#define MODEL_ID_MAX (NN_MODEL_MAX_SLOT_COUNT - 1)
 
 typedef struct {
     const char *label;

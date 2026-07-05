@@ -11,6 +11,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "nn_model.h"
@@ -43,6 +44,21 @@
 #define BUTTON_LONG_PRESS_MS 800
 #endif
 
+#define UI_EVENT_QUEUE_LEN 32
+#define UI_TASK_PRIORITY 6
+
+typedef enum {
+    UI_GPIO_EVENT_ENCODER = 0,
+    UI_GPIO_EVENT_BUTTON,
+} ui_gpio_event_type_t;
+
+typedef struct {
+    ui_gpio_event_type_t type;
+    TickType_t tick;
+    uint8_t encoder_state;
+    bool button_pressed;
+} ui_gpio_event_t;
+
 typedef enum {
     BUTTON_EVENT_NONE = 0,
     BUTTON_EVENT_CLICK,
@@ -64,6 +80,17 @@ static sys_config_param_id_t g_selected_param = SYS_CONFIG_PARAM_MOTION_THRESHOL
 static int g_model_cursor = 0;
 static char g_notice[24] = {0};
 static TickType_t g_notice_until = 0;
+static QueueHandle_t g_ui_event_queue = NULL;
+
+static bool g_button_raw_pressed_last = false;
+static bool g_button_stable_pressed = false;
+static bool g_button_long_press_reported = false;
+static TickType_t g_button_last_raw_change_tick = 0;
+static TickType_t g_button_press_start_tick = 0;
+
+static bool g_encoder_initialized = false;
+static uint8_t g_encoder_last_state = 0;
+static int g_encoder_accumulator = 0;
 
 static const int8_t g_encoder_table[16] = {
     0, -1, 1, 0,
@@ -407,22 +434,47 @@ static void oled_draw_param_screen(void)
 static void oled_draw_model_screen(void)
 {
     char line[32];
+    int count = nn_model_get_slot_count();
+    const int visible_rows = 4;
 
     oled_clear_fb();
     oled_draw_text_center(0, "SELECT MODEL", false);
-    for (int i = 0; i < nn_model_get_slot_count(); i++) {
-        bool selected = (i == g_model_cursor);
-        const char *state = nn_model_is_installed(i) ? "READY" : "EMPTY";
-        int page = 2 + i;
+    if (count <= 0) {
+        oled_draw_text_center(3, "NO SD MODEL", false);
+        oled_draw_text_center(6, "CHECK SD", false);
+        oled_flush();
+        return;
+    }
+
+    int start = g_model_cursor - visible_rows + 1;
+    if (start < 0) {
+        start = 0;
+    }
+    if (start > count - visible_rows) {
+        start = count - visible_rows;
+    }
+    if (start < 0) {
+        start = 0;
+    }
+
+    for (int row = 0; row < visible_rows && start + row < count; row++) {
+        int model_id = start + row;
+        bool selected = (model_id == g_model_cursor);
+        const char *state = nn_model_is_installed(model_id) ? "READY" : "EMPTY";
+        int page = 2 + row;
 
         if (selected) {
             oled_fill_page(page, 0xff);
         }
-        snprintf(line, sizeof(line), "%s", nn_model_get_slot_name(i));
+        snprintf(line, sizeof(line), "%s", nn_model_get_slot_name(model_id));
         oled_draw_text_ex(6, page, line, selected);
         oled_draw_text_right(124, page, state, selected);
     }
-    oled_draw_text_center(6, "CLICK OK", false);
+    snprintf(line, sizeof(line), "%u/%u",
+             (unsigned)(g_model_cursor + 1),
+             (unsigned)count);
+    oled_draw_text(0, 7, line);
+    oled_draw_text_right(124, 7, "CLICK OK", false);
     oled_flush();
 }
 
@@ -538,9 +590,49 @@ static esp_err_t encoder_init(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&input_cfg), TAG, "encoder GPIO config failed");
+    return ESP_OK;
+}
+
+static void IRAM_ATTR ui_gpio_isr_handler(void *arg)
+{
+    if (g_ui_event_queue == NULL) {
+        return;
+    }
+
+    gpio_num_t gpio = (gpio_num_t)(intptr_t)arg;
+    ui_gpio_event_t event = {
+        .type = (gpio == ENCODER_SW_GPIO) ? UI_GPIO_EVENT_BUTTON : UI_GPIO_EVENT_ENCODER,
+        .tick = xTaskGetTickCountFromISR(),
+        .encoder_state = (uint8_t)(((gpio_get_level(ENCODER_A_GPIO) ? 1 : 0) << 1) |
+                                   (gpio_get_level(ENCODER_B_GPIO) ? 1 : 0)),
+        .button_pressed = (gpio_get_level(ENCODER_SW_GPIO) == 0),
+    };
+
+    BaseType_t high_task_woken = pdFALSE;
+    (void)xQueueSendFromISR(g_ui_event_queue, &event, &high_task_woken);
+    if (high_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static esp_err_t ui_gpio_interrupts_init(void)
+{
+    esp_err_t ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "GPIO ISR service init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(ENCODER_A_GPIO, ui_gpio_isr_handler, (void *)(intptr_t)ENCODER_A_GPIO),
+                        TAG, "encoder A ISR add failed");
+    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(ENCODER_B_GPIO, ui_gpio_isr_handler, (void *)(intptr_t)ENCODER_B_GPIO),
+                        TAG, "encoder B ISR add failed");
+    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(ENCODER_SW_GPIO, ui_gpio_isr_handler, (void *)(intptr_t)ENCODER_SW_GPIO),
+                        TAG, "encoder button ISR add failed");
+
     return ESP_OK;
 }
 
@@ -564,6 +656,10 @@ static void handle_encoder_delta(int delta)
 
     if (g_screen == UI_SCREEN_MODEL_SELECT) {
         int count = nn_model_get_slot_count();
+        if (count <= 0) {
+            ui_render();
+            return;
+        }
         g_model_cursor = (g_model_cursor + delta) % count;
         if (g_model_cursor < 0) {
             g_model_cursor += count;
@@ -583,7 +679,10 @@ static void handle_short_click(void)
     }
 
     if (g_screen == UI_SCREEN_MODEL_SELECT) {
-        if (nn_model_is_installed(g_model_cursor)) {
+        int count = nn_model_get_slot_count();
+        if (count <= 0) {
+            enter_notice("NO SD MODEL", 1200);
+        } else if (nn_model_is_installed(g_model_cursor)) {
             if (nn_model_select(g_model_cursor) == ESP_OK) {
                 g_screen = UI_SCREEN_PARAMS;
                 ui_render();
@@ -591,7 +690,7 @@ static void handle_short_click(void)
                 enter_notice("MODEL ERR", 1200);
             }
         } else {
-            enter_notice("MODEL 2 EMPTY", 1200);
+            enter_notice("MODEL EMPTY", 1200);
         }
         return;
     }
@@ -602,81 +701,162 @@ static void handle_short_click(void)
 
 static void handle_long_press(void)
 {
+    if (nn_model_get_slot_count() <= 0) {
+        nn_model_rescan();
+    }
     g_screen = UI_SCREEN_MODEL_SELECT;
     g_model_cursor = nn_model_get_active_id();
+    int count = nn_model_get_slot_count();
+    if (count <= 0) {
+        g_model_cursor = 0;
+    } else if (g_model_cursor >= count) {
+        g_model_cursor = count - 1;
+    }
     ui_render();
 }
 
-static int encoder_poll_delta(void)
+static uint8_t encoder_read_state(void)
 {
-    static bool initialized = false;
-    static uint8_t last_state = 0;
-    static int accumulator = 0;
+    return (uint8_t)(((gpio_get_level(ENCODER_A_GPIO) ? 1 : 0) << 1) |
+                     (gpio_get_level(ENCODER_B_GPIO) ? 1 : 0));
+}
 
-    uint8_t current_state = ((gpio_get_level(ENCODER_A_GPIO) ? 1 : 0) << 1) |
-                            (gpio_get_level(ENCODER_B_GPIO) ? 1 : 0);
-    if (!initialized) {
-        last_state = current_state;
-        initialized = true;
+static bool button_read_pressed(void)
+{
+    return gpio_get_level(ENCODER_SW_GPIO) == 0;
+}
+
+static int encoder_process_state(uint8_t current_state)
+{
+    if (!g_encoder_initialized) {
+        g_encoder_last_state = current_state;
+        g_encoder_initialized = true;
         return 0;
     }
 
-    int8_t movement = g_encoder_table[(last_state << 2) | current_state];
-    last_state = current_state;
+    int8_t movement = g_encoder_table[(g_encoder_last_state << 2) | current_state];
+    g_encoder_last_state = current_state;
     if (movement == 0) {
         return 0;
     }
 
-    accumulator += movement;
+    g_encoder_accumulator += movement;
     if (current_state == 0x03) {
-        if (accumulator >= 4) {
-            accumulator = 0;
+        if (g_encoder_accumulator >= 4) {
+            g_encoder_accumulator = 0;
             return 1;
         }
-        if (accumulator <= -4) {
-            accumulator = 0;
+        if (g_encoder_accumulator <= -4) {
+            g_encoder_accumulator = 0;
             return -1;
         }
-        accumulator = 0;
+        g_encoder_accumulator = 0;
     }
 
     return 0;
 }
 
-static button_event_t button_poll_event(void)
+static void button_note_raw_state(bool raw_pressed, TickType_t tick)
 {
-    static bool raw_pressed_last = false;
-    static bool stable_pressed = false;
-    static bool long_press_reported = false;
-    static TickType_t last_raw_change_tick = 0;
-    static TickType_t press_start_tick = 0;
-
-    TickType_t now = xTaskGetTickCount();
-    bool raw_pressed = gpio_get_level(ENCODER_SW_GPIO) == 0;
-
-    if (raw_pressed != raw_pressed_last) {
-        raw_pressed_last = raw_pressed;
-        last_raw_change_tick = now;
+    if (raw_pressed != g_button_raw_pressed_last) {
+        g_button_raw_pressed_last = raw_pressed;
+        g_button_last_raw_change_tick = tick;
     }
+}
 
-    if ((now - last_raw_change_tick) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS) &&
-        raw_pressed != stable_pressed) {
-        stable_pressed = raw_pressed;
-        if (stable_pressed) {
-            press_start_tick = now;
-            long_press_reported = false;
-        } else if (!long_press_reported) {
+static button_event_t button_process_timers(TickType_t now)
+{
+    if ((now - g_button_last_raw_change_tick) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS) &&
+        g_button_raw_pressed_last != g_button_stable_pressed) {
+        g_button_stable_pressed = g_button_raw_pressed_last;
+        if (g_button_stable_pressed) {
+            g_button_press_start_tick = now;
+            g_button_long_press_reported = false;
+        } else if (!g_button_long_press_reported) {
             return BUTTON_EVENT_CLICK;
         }
     }
 
-    if (stable_pressed && !long_press_reported &&
-        (now - press_start_tick) >= pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS)) {
-        long_press_reported = true;
+    if (g_button_stable_pressed && !g_button_long_press_reported &&
+        (now - g_button_press_start_tick) >= pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS)) {
+        g_button_long_press_reported = true;
         return BUTTON_EVENT_LONG_PRESS;
     }
 
     return BUTTON_EVENT_NONE;
+}
+
+static bool ui_tick_due(TickType_t now, TickType_t deadline)
+{
+    return (TickType_t)(now - deadline) < (TickType_t)(portMAX_DELAY / 2);
+}
+
+static TickType_t ui_ticks_until(TickType_t now, TickType_t deadline)
+{
+    if (ui_tick_due(now, deadline)) {
+        return 0;
+    }
+    return deadline - now;
+}
+
+static TickType_t ui_min_wait(TickType_t current, TickType_t candidate)
+{
+    return (candidate < current) ? candidate : current;
+}
+
+static TickType_t ui_next_wait_ticks(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    TickType_t wait_ticks = portMAX_DELAY;
+
+    if (g_button_raw_pressed_last != g_button_stable_pressed) {
+        TickType_t deadline = g_button_last_raw_change_tick + pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS);
+        wait_ticks = ui_min_wait(wait_ticks, ui_ticks_until(now, deadline));
+    }
+
+    if (g_button_stable_pressed && !g_button_long_press_reported) {
+        TickType_t deadline = g_button_press_start_tick + pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS);
+        wait_ticks = ui_min_wait(wait_ticks, ui_ticks_until(now, deadline));
+    }
+
+    if (g_screen == UI_SCREEN_NOTICE) {
+        wait_ticks = ui_min_wait(wait_ticks, ui_ticks_until(now, g_notice_until));
+    }
+
+    return wait_ticks;
+}
+
+static void ui_process_button_event(button_event_t button_event)
+{
+    if (button_event == BUTTON_EVENT_CLICK) {
+        handle_short_click();
+    } else if (button_event == BUTTON_EVENT_LONG_PRESS) {
+        handle_long_press();
+    }
+}
+
+static void ui_process_timers(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    ui_process_button_event(button_process_timers(now));
+
+    if (g_screen == UI_SCREEN_NOTICE && ui_tick_due(now, g_notice_until)) {
+        g_screen = UI_SCREEN_PARAMS;
+        ui_render();
+    }
+}
+
+static void ui_process_gpio_event(const ui_gpio_event_t *event)
+{
+    if (event->type == UI_GPIO_EVENT_ENCODER) {
+        int encoder_delta = encoder_process_state(event->encoder_state);
+        if (encoder_delta != 0) {
+            handle_encoder_delta(encoder_delta);
+        }
+        return;
+    }
+
+    button_note_raw_state(event->button_pressed, event->tick);
 }
 
 static void ui_task(void *pvParameters)
@@ -686,25 +866,16 @@ static void ui_task(void *pvParameters)
     ui_render();
 
     while (true) {
-        int encoder_delta = encoder_poll_delta();
-        if (encoder_delta != 0) {
-            handle_encoder_delta(encoder_delta);
+        ui_process_timers();
+
+        ui_gpio_event_t event;
+        if (xQueueReceive(g_ui_event_queue, &event, ui_next_wait_ticks()) == pdTRUE) {
+            do {
+                ui_process_gpio_event(&event);
+            } while (xQueueReceive(g_ui_event_queue, &event, 0) == pdTRUE);
         }
 
-        button_event_t button_event = button_poll_event();
-        if (button_event == BUTTON_EVENT_CLICK) {
-            handle_short_click();
-        } else if (button_event == BUTTON_EVENT_LONG_PRESS) {
-            handle_long_press();
-        }
-
-        if (g_screen == UI_SCREEN_NOTICE && xTaskGetTickCount() >= g_notice_until) {
-            g_screen = UI_SCREEN_PARAMS;
-            ui_render();
-        }
-
-        // 修复：更改为 10ms 延时以防 pdMS_TO_TICKS(2) 得到 0 并引起看门狗溢出
-        vTaskDelay(pdMS_TO_TICKS(10));
+        ui_process_timers();
     }
 }
 
@@ -721,12 +892,34 @@ esp_err_t ui_controller_init(void)
         return ret;
     }
 
+    g_encoder_last_state = encoder_read_state();
+    g_encoder_initialized = true;
+    g_encoder_accumulator = 0;
+
+    g_button_raw_pressed_last = button_read_pressed();
+    g_button_stable_pressed = g_button_raw_pressed_last;
+    g_button_long_press_reported = false;
+    g_button_last_raw_change_tick = xTaskGetTickCount();
+    g_button_press_start_tick = g_button_last_raw_change_tick;
+
+    g_ui_event_queue = xQueueCreate(UI_EVENT_QUEUE_LEN, sizeof(ui_gpio_event_t));
+    if (g_ui_event_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create UI event queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ret = ui_gpio_interrupts_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UI GPIO interrupt init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     BaseType_t task_ret = xTaskCreatePinnedToCore(
         ui_task,
         "ui_task",
         4096,
         NULL,
-        2,
+        UI_TASK_PRIORITY,
         NULL,
         1);
     if (task_ret != pdPASS) {

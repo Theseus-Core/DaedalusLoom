@@ -82,3 +82,4 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 .cache/
 src/firmware-code/motion-inference/build_cnn1d_sd/esp-idf/esptool_py/app-flash_args.in
+.venv_convert/
