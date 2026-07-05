@@ -37,11 +37,38 @@ static QueueHandle_t xReadyInferenceQueue = NULL;
 
 #define NUM_BUFFERS 3
 
+static int gesture_severity_from_name(const char *class_name)
+{
+    if (!class_name) {
+        return 1;
+    }
+
+    if (strcmp(class_name, "fall_down") == 0 ||
+        strcmp(class_name, "跌倒") == 0 ||
+        strcmp(class_name, "wave_hand") == 0 ||
+        strcmp(class_name, "举手呼叫") == 0) {
+        return 5;
+    }
+
+    if (strcmp(class_name, "waveup") == 0 ||
+        strcmp(class_name, "起身") == 0) {
+        return 3;
+    }
+
+    if (strcmp(class_name, "roll") == 0 ||
+        strcmp(class_name, "翻身") == 0) {
+        return 1;
+    }
+
+    return 1;
+}
+
 static void sent_web_observer(const gesture_result_t *result, void *user_data)
 {
     if (!result->is_realtime) {
         char url[128];
         char json_buffer[256];  // ✅ 分配足够的栈空间
+        int severity = gesture_severity_from_name(result->class_name);
         
         // 构造URL
         snprintf(url, sizeof(url), "%s/api/sensor/signal", CONFIG_ddloom_base_url);
@@ -55,7 +82,7 @@ static void sent_web_observer(const gesture_result_t *result, void *user_data)
                  result->class_name,
                  "动作结束",
                  "true",  // ✅ 不加引号，JSON布尔值
-                 1);      // severity
+                 severity);
         
         // 发送数据
         upload_info(url, json_buffer);
@@ -195,6 +222,7 @@ static void csi_uart_rx_task(void *pvParameters)
     bool is_moving = false;
     int motion_trigger_counter = 0;
     int idle_counter = 0;
+    TickType_t cooldown_until = 0;
     
     while (true) {
         if (csi_source_read_frame(frame)) {
@@ -217,8 +245,18 @@ static void csi_uart_rx_task(void *pvParameters)
                 
                 sys_config_t config;
                 sys_config_get(&config);
+                TickType_t now = xTaskGetTickCount();
+                bool cooldown_active = (cooldown_until != 0) &&
+                                       ((int32_t)(cooldown_until - now) > 0);
+                if (!cooldown_active) {
+                    cooldown_until = 0;
+                }
                 
-                if (motion_val >= config.motion_threshold) {
+                if (cooldown_active) {
+                    is_moving = false;
+                    motion_trigger_counter = 0;
+                    idle_counter = 0;
+                } else if (motion_val >= config.motion_threshold) {
                     idle_counter = 0;
                     if (!is_moving) {
                         motion_trigger_counter++;
@@ -261,6 +299,12 @@ static void csi_uart_rx_task(void *pvParameters)
                                 .is_ended = true
                             };
                             xQueueSend(xReadyInferenceQueue, &job, portMAX_DELAY);
+                            if (config.gesture_cooldown_sec > 0.0f) {
+                                uint32_t cooldown_ms = (uint32_t)(config.gesture_cooldown_sec * 1000.0f);
+                                cooldown_until = xTaskGetTickCount() + pdMS_TO_TICKS(cooldown_ms);
+                            } else {
+                                cooldown_until = 0;
+                            }
                             
                             ESP_LOGI(TAG, "[MOTION ENDED] Returning to standby.");
                         }

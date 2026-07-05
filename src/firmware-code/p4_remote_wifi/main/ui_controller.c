@@ -347,6 +347,12 @@ static void format_param_value(sys_config_param_id_t param, char *buf, size_t bu
             value = 100;
         }
         snprintf(buf, buf_size, "%u.%u", (unsigned)(value / 10), (unsigned)(value % 10));
+    } else if (param == SYS_CONFIG_PARAM_GESTURE_COOLDOWN) {
+        snprintf(buf,
+                 buf_size,
+                 "%u.%us",
+                 (unsigned)(value / 2),
+                 (unsigned)((value % 2) * 5));
     } else {
         snprintf(buf, buf_size, "%u%s", (unsigned)value, sys_config_get_param_unit(param));
     }
@@ -365,6 +371,10 @@ static void get_param_range(sys_config_param_id_t param, int *min_value, int *ma
         break;
     case SYS_CONFIG_PARAM_REQUIRED_TRIGGER_FRAMES:
         *min_value = 1;
+        *max_value = 20;
+        break;
+    case SYS_CONFIG_PARAM_GESTURE_COOLDOWN:
+        *min_value = 0;
         *max_value = 20;
         break;
     case SYS_CONFIG_PARAM_DEBOUNCE_FRAMES:
@@ -411,7 +421,7 @@ static void oled_draw_param_screen(void)
 
     for (int i = 0; i < SYS_CONFIG_PARAM_COUNT; i++) {
         sys_config_param_id_t param = (sys_config_param_id_t)i;
-        int page = 2 + i;
+        int page = 1 + i;
         bool selected = (param == g_selected_param);
 
         if (selected) {

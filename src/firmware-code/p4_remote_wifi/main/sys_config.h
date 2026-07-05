@@ -13,6 +13,7 @@ typedef enum {
     SYS_CONFIG_PARAM_MIN_CONFIDENCE,
     SYS_CONFIG_PARAM_REQUIRED_TRIGGER_FRAMES,
     SYS_CONFIG_PARAM_DEBOUNCE_FRAMES,
+    SYS_CONFIG_PARAM_GESTURE_COOLDOWN,
     SYS_CONFIG_PARAM_COUNT
 } sys_config_param_id_t;
 
@@ -22,6 +23,7 @@ typedef struct {
     int debounce_frames;           // 运动结束消抖帧数
     int required_trigger_frames;   // 运动开始确认帧数
     float min_confidence;          // 实时预测最小置信度过滤阈值
+    float gesture_cooldown_sec;    // 动作结束后的下一次识别冷却时间（秒）
     int active_model_id;           // 当前启用的模型槽位 ID
 } sys_config_t;
 
@@ -83,6 +85,16 @@ float sys_config_get_min_confidence(void);
  * @brief 设置实时预测过滤的最小置信度阈值
  */
 void sys_config_set_min_confidence(float val);
+
+/**
+ * @brief 获取动作识别冷却时间（秒）
+ */
+float sys_config_get_gesture_cooldown_sec(void);
+
+/**
+ * @brief 设置动作识别冷却时间（秒）
+ */
+void sys_config_set_gesture_cooldown_sec(float val);
 
 /**
  * @brief 获取当前启用的模型槽位 ID

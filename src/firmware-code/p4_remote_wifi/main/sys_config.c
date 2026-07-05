@@ -13,6 +13,8 @@
 #define REQUIRED_TRIGGER_MAX_FRAMES 20
 #define DEBOUNCE_MIN_FRAMES 1
 #define DEBOUNCE_MAX_FRAMES 50
+#define GESTURE_COOLDOWN_MIN_X2 0
+#define GESTURE_COOLDOWN_MAX_X2 20
 #define MODEL_ID_MIN 0
 #define MODEL_ID_MAX (NN_MODEL_MAX_SLOT_COUNT - 1)
 
@@ -26,6 +28,7 @@ static const param_meta_t g_param_meta[SYS_CONFIG_PARAM_COUNT] = {
     [SYS_CONFIG_PARAM_MIN_CONFIDENCE] = {"Conf", "%"},
     [SYS_CONFIG_PARAM_REQUIRED_TRIGGER_FRAMES] = {"Trig", "frm"},
     [SYS_CONFIG_PARAM_DEBOUNCE_FRAMES] = {"Idle", "frm"},
+    [SYS_CONFIG_PARAM_GESTURE_COOLDOWN] = {"Cool", "s"},
 };
 
 // 全局配置实例，默认值与重构前一致
@@ -34,6 +37,7 @@ static sys_config_t g_config = {
     .debounce_frames = 15,
     .required_trigger_frames = 3,
     .min_confidence = 0.80f,
+    .gesture_cooldown_sec = 0.0f,
     .active_model_id = 0,
 };
 
@@ -76,6 +80,9 @@ static void normalize_config_locked(void)
     g_config.debounce_frames = clamp_int(g_config.debounce_frames,
                                          DEBOUNCE_MIN_FRAMES,
                                          DEBOUNCE_MAX_FRAMES);
+    g_config.gesture_cooldown_sec = clamp_float(g_config.gesture_cooldown_sec,
+                                                GESTURE_COOLDOWN_MIN_X2 / 2.0f,
+                                                GESTURE_COOLDOWN_MAX_X2 / 2.0f);
     g_config.active_model_id = clamp_int(g_config.active_model_id, MODEL_ID_MIN, MODEL_ID_MAX);
 }
 
@@ -86,6 +93,7 @@ void sys_config_init(void)
     g_config.debounce_frames = 15;
     g_config.required_trigger_frames = 3;
     g_config.min_confidence = 0.80f;
+    g_config.gesture_cooldown_sec = 0.0f;
     g_config.active_model_id = 0;
     normalize_config_locked();
     portEXIT_CRITICAL(&g_config_mux);
@@ -180,6 +188,24 @@ void sys_config_set_min_confidence(float val)
     portEXIT_CRITICAL(&g_config_mux);
 }
 
+float sys_config_get_gesture_cooldown_sec(void)
+{
+    float val;
+    portENTER_CRITICAL(&g_config_mux);
+    val = g_config.gesture_cooldown_sec;
+    portEXIT_CRITICAL(&g_config_mux);
+    return val;
+}
+
+void sys_config_set_gesture_cooldown_sec(float val)
+{
+    portENTER_CRITICAL(&g_config_mux);
+    g_config.gesture_cooldown_sec = clamp_float(val,
+                                                GESTURE_COOLDOWN_MIN_X2 / 2.0f,
+                                                GESTURE_COOLDOWN_MAX_X2 / 2.0f);
+    portEXIT_CRITICAL(&g_config_mux);
+}
+
 int sys_config_get_active_model_id(void)
 {
     int val;
@@ -230,6 +256,14 @@ esp_err_t sys_config_adjust_param(sys_config_param_id_t param_id, int delta_disp
                                              DEBOUNCE_MIN_FRAMES,
                                              DEBOUNCE_MAX_FRAMES);
         break;
+    case SYS_CONFIG_PARAM_GESTURE_COOLDOWN: {
+        int display = (int)lroundf(g_config.gesture_cooldown_sec * 2.0f);
+        display = clamp_int(display + delta_display_units,
+                            GESTURE_COOLDOWN_MIN_X2,
+                            GESTURE_COOLDOWN_MAX_X2);
+        g_config.gesture_cooldown_sec = display / 2.0f;
+        break;
+    }
     default:
         portEXIT_CRITICAL(&g_config_mux);
         return ESP_ERR_INVALID_ARG;
@@ -254,6 +288,9 @@ int sys_config_get_param_display_value(sys_config_param_id_t param_id)
         break;
     case SYS_CONFIG_PARAM_DEBOUNCE_FRAMES:
         display = g_config.debounce_frames;
+        break;
+    case SYS_CONFIG_PARAM_GESTURE_COOLDOWN:
+        display = (int)lroundf(g_config.gesture_cooldown_sec * 2.0f);
         break;
     default:
         display = 0;

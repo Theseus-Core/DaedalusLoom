@@ -1,0 +1,10 @@
+{
+  "name": "Hospital_inspection_system",
+  "num_classes": 4,
+  "labels": [
+    "fall_down",
+    "roll",
+    "waveup",
+    "wave_hand"
+  ]
+}
