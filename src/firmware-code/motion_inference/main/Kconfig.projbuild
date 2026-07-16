@@ -1,0 +1,21 @@
+menu "Project Config"
+    config ddloom_base_url
+        string "Base URL"
+        
+        
+        default "http://127.0.0.1:5000"
+        help
+            Set the upload base url.
+
+    config ddloom_WIFI_SSID
+        string "WiFi SSID"
+        default "Lixeer"
+        help
+            The SSID of your WiFi Access Point.
+    config ddloom_WIFI_PASSWORD
+        string "WiFi Password"
+        default "cwb20051027"
+        help
+            The password for your WiFi Access Point.
+    
+endmenu

@@ -1,0 +1,22 @@
+{
+  "name": "best_multi_branch_cnn_fusion",
+  "is_multi_branch": true,
+  "action_branch": {
+    "num_classes": 4,
+    "labels": [
+      "画o",
+      "抓握",
+      "扣肩",
+      "展臂"
+    ],
+    "output_name": "action_logits"
+  },
+  "person_branch": {
+    "num_classes": 2,
+    "labels": [
+      "张三",
+      "李四"
+    ],
+    "output_name": "person_logits"
+  }
+}

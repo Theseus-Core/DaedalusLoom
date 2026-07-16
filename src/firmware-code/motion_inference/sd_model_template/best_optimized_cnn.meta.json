@@ -1,0 +1,10 @@
+{
+  "name": "best_optimized_cnn",
+  "num_classes": 4,
+  "labels": [
+    "高抬腿",
+    "展臂",
+    "深蹲",
+    "Unknown"
+  ]
+}
