@@ -18,10 +18,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_err.h"
 #include "nvs_flash.h"
 
-#include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
+#include "soc/gpio_num.h"
+
 
 #include "esp_csi_gain_ctrl.h"
 #include "esp_log.h"
@@ -30,6 +33,8 @@
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "rom/ets_sys.h"
+
+#include "storage.h"
 
 #define CONFIG_LESS_INTERFERENCE_CHANNEL 11
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 ||                                     \
@@ -59,23 +64,26 @@
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
+
 #define IS_PRINT_CSI_INFO 1
 
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const char *TAG = "csi_recv";
 static int g_csi_package_count = 0;
 
-#define EX_UART_NUM         UART_NUM_1
-#define UART_TXD_PIN        11
-#define UART_RXD_PIN        12
-#define UART_BAUD_RATE      921600
+#define EX_UART_NUM UART_NUM_1
+#define UART_TXD_PIN 11
+#define UART_RXD_PIN 12
+#define UART_BAUD_RATE 921600
 #define CSI_TO_UART_ENABLED 1
 
+#define SWITCH_GPIO GPIO_NUM_23
 
-
-
-
-
+typedef enum
+{
+    TO_CONSOLE = 0,
+    TO_UART = 1,
+} CSI_DATA_OUTPUT_MODE;
 
 static void uart_init(void)
 {
@@ -87,55 +95,62 @@ static void uart_init(void)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    
+
     ESP_ERROR_CHECK(uart_driver_install(EX_UART_NUM, 1024, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(EX_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(EX_UART_NUM, UART_TXD_PIN, UART_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_pin(EX_UART_NUM, UART_TXD_PIN, UART_RXD_PIN, UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE));
 }
 
 static void uart_send_csi_binary(uint32_t seq, int8_t *buf, uint16_t len, float compensate_gain)
 {
-    if (len > 1024) {
+    if (len > 1024)
+    {
         len = 1024;
     }
-    
+
     uint8_t header[10];
     header[0] = 'C';
     header[1] = 'S';
     header[2] = 'I';
     header[3] = '1';
-    
+
     // seq (4字节，小端)
     header[4] = (uint8_t)(seq & 0xFF);
     header[5] = (uint8_t)((seq >> 8) & 0xFF);
     header[6] = (uint8_t)((seq >> 16) & 0xFF);
     header[7] = (uint8_t)((seq >> 24) & 0xFF);
-    
+
     // len (2字节，小端)
     header[8] = (uint8_t)(len & 0xFF);
     header[9] = (uint8_t)((len >> 8) & 0xFF);
-    
+
     int8_t payload[1024];
-    for (uint16_t i = 0; i < len; ++i) {
+    for (uint16_t i = 0; i < len; ++i)
+    {
         int val = (int)(compensate_gain * buf[i]);
-        if (val > 127) val = 127;
-        if (val < -128) val = -128;
+        if (val > 127)
+            val = 127;
+        if (val < -128)
+            val = -128;
         payload[i] = (int8_t)val;
     }
-    
+
     // 校验和 (头10字节之和 + 载荷之和，低16位)
     uint32_t sum = 0;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 10; ++i)
+    {
         sum += header[i];
     }
-    for (uint16_t i = 0; i < len; ++i) {
+    for (uint16_t i = 0; i < len; ++i)
+    {
         sum += (uint8_t)payload[i];
     }
-    
+
     uint8_t checksum_bytes[2];
     checksum_bytes[0] = (uint8_t)(sum & 0xFF);
     checksum_bytes[1] = (uint8_t)((sum >> 8) & 0xFF);
-    
+
     uart_write_bytes(EX_UART_NUM, (const char *)header, 10);
     uart_write_bytes(EX_UART_NUM, (const char *)payload, len);
     uart_write_bytes(EX_UART_NUM, (const char *)checksum_bytes, 2);
@@ -267,7 +282,8 @@ __attribute__((unused)) static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *i
 #endif
     }
     esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
-    //ESP_LOGI(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain,fft_gain);
+    // ESP_LOGI(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain,
+    // agc_gain,fft_gain);
 #endif
 
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
@@ -314,17 +330,16 @@ __attribute__((unused)) static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *i
     }
 #else
     printf(",%d,%d,\"[%d", info->len, info->first_word_invalid,
-               (int16_t)(compensate_gain * info->buf[0]));
-    
+           (int16_t)(compensate_gain * info->buf[0]));
+
     for (int i = 1; i < info->len; i++)
-    {   
-        
+    {
+
         printf(",%d", (int16_t)(compensate_gain * info->buf[i]));
     }
 #endif
     printf("]\"\n");
 #endif
-
 
 #if CSI_TO_UART_ENABLED
     uart_send_csi_binary(rx_id, info->buf, info->len, compensate_gain);
@@ -332,14 +347,7 @@ __attribute__((unused)) static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *i
     s_count++;
 }
 
-
-
-
-
-
-
-
-void temp_callback(void *ctx, wifi_csi_info_t *info)
+void callback2console(void *ctx, wifi_csi_info_t *info)
 {
 
     if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6))
@@ -370,34 +378,62 @@ void temp_callback(void *ctx, wifi_csi_info_t *info)
     // ESP_LOGI(TAG, "info.len: %d", info->len);
 
     g_csi_package_count++;
+    printf("index:%d len:%d compensate_gain:%f data:[", g_csi_package_count, info->len,
+           compensate_gain);
 
-#if IS_PRINT_CSI_INFO
-    //ESP_LOGI(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain,agc_gain, fft_gain);
-    printf("index:%d len:%d compensate_gain:%f data:[", g_csi_package_count, info->len, compensate_gain);
-    
-    
     if (info->len > 0)
     {
 
         printf("%d", (int16_t)(compensate_gain * info->buf[0]));
         // 剩下的元素前面加逗号
         for (int i = 1; i < info->len; i++)
-        {   
-            
+        {
+
             printf(",%d", (int16_t)(compensate_gain * info->buf[i]));
         }
     }
-    
-    
 
     printf("]\n");
-#endif
-#if CSI_TO_UART_ENABLED
-    uart_send_csi_binary(g_csi_package_count, info->buf, info->len, compensate_gain);
-#endif
+
+
 }
 
-static void wifi_csi_init()
+
+void callback2uart(void *ctx, wifi_csi_info_t *info)
+{
+
+    if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6))
+    {
+        return;
+    }
+    const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
+    float compensate_gain = 1.0f;
+    static uint8_t agc_gain = 0;
+    static int8_t fft_gain = 0;
+    static uint8_t agc_gain_baseline = 0;
+    static int8_t fft_gain_baseline = 0;
+
+    esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);
+    if (g_csi_package_count < 100)
+    {
+        esp_csi_gain_ctrl_record_rx_gain(agc_gain, fft_gain);
+    }
+    else if (g_csi_package_count == 100)
+    {
+        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline, &fft_gain_baseline);
+    }
+    esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain,
+                                            fft_gain); // 各种增益补偿计算
+
+    g_csi_package_count++;
+    uart_send_csi_binary(g_csi_package_count, info->buf, info->len, compensate_gain);
+
+}
+
+
+
+
+static void wifi_csi_init(wifi_csi_cb_t recv_data_cb)
 {
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 
@@ -442,8 +478,16 @@ static void wifi_csi_init()
     };
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
-    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(temp_callback, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(recv_data_cb, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+}
+
+void gpio_init(void)
+{
+    // 1. 设置引脚为输入模式
+    gpio_set_direction(SWITCH_GPIO, GPIO_MODE_INPUT);
+    // 2. 启用内部上拉电阻（以按键接GND为例）
+    gpio_set_pull_mode(SWITCH_GPIO, GPIO_PULLUP_ONLY);
 }
 
 void app_main()
@@ -451,22 +495,49 @@ void app_main()
     /**
      * @brief Initialize NVS
      */
-    ESP_LOGI(TAG,"d");
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+    storage_init();
+    gpio_init();
 
-    /**
-     * @brief Initialize Wi-Fi
-     */
-#if CSI_TO_UART_ENABLED
-    uart_init();
-#endif
-    
+    int enable_switch = gpio_get_level(SWITCH_GPIO);
+    ESP_LOGI(TAG, "Switch GPIO level: %d", enable_switch);
+    if (enable_switch == 0)
+    {
+        int8_t output_mode;
+        esp_err_t ret = easy_read_i8("system_config", "output_mode", &output_mode);
+        if (ret == ESP_OK)
+        {
+            if (output_mode == (int8_t)TO_CONSOLE)
+            {
+                ESP_LOGI(TAG, "Output mode: TO_CONSOLE");
+                output_mode = TO_UART;
+                easy_save_i8("system_config", "output_mode", &output_mode);
+            }
+            else if (output_mode == (int8_t)TO_UART)
+            {
+                ESP_LOGI(TAG, "Output mode: TO_UART");
+                output_mode = TO_CONSOLE;
+                easy_save_i8("system_config", "output_mode", &output_mode);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Unknown output mode: %d", output_mode);
+            }
+        }
+        else
+        {
+            int8_t default_mode = TO_CONSOLE;
+            ret = easy_save_i8("system_config", "output_mode", &default_mode);
+        }
+    }
+    int8_t output_mode;
+    easy_read_i8("system_config", "output_mode", &output_mode);
+    ESP_LOGD(TAG, "Output mode: %d", output_mode);
+    if (output_mode == (int8_t)TO_UART)
+    {
+        ESP_LOGI(TAG, "Setting callback to UART");
+        uart_init();
+       
+    }
     wifi_init();
 
     /**
@@ -483,6 +554,15 @@ void app_main()
     };
 
     wifi_esp_now_init(peer);
+    if (output_mode == (int8_t)TO_UART)
+    {
+        ESP_LOGI(TAG, "Setting callback to UART");
+        wifi_csi_init(callback2uart);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Setting callback to Console");
+        wifi_csi_init(callback2console);
+    }
     
-    wifi_csi_init();    
 }
