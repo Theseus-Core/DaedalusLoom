@@ -67,7 +67,9 @@
 
 #define IS_PRINT_CSI_INFO 1
 
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x40, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x01};
+
 static const char *TAG = "csi_recv";
 static int g_csi_package_count = 0;
 
@@ -102,7 +104,8 @@ static void uart_init(void)
                                  UART_PIN_NO_CHANGE));
 }
 
-static void uart_send_csi_binary(uint32_t seq, int8_t *buf, uint16_t len, float compensate_gain)
+
+static void uart_send_csi_binary(uint32_t seq, int8_t *buf, uint16_t len, float compensate_gain )
 {
     if (len > 1024)
     {
@@ -232,7 +235,7 @@ static void wifi_init()
     }
 #endif
 
-    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_RECV_MAC));
 }
 
 static void wifi_esp_now_init(esp_now_peer_info_t peer)

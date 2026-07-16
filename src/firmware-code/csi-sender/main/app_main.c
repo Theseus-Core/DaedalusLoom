@@ -45,7 +45,11 @@
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
 
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x40, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+
 static const char *TAG = "csi_send";
 
 static void wifi_init()
@@ -172,6 +176,7 @@ void app_main()
         .encrypt = false,
         .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
     };
+    memcpy(peer.peer_addr, CONFIG_CSI_RECV_MAC, 6);
     wifi_esp_now_init(peer);
 
     ESP_LOGI(TAG, "================ CSI SEND ================");
