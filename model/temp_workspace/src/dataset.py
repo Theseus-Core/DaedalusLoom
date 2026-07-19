@@ -1,20 +1,18 @@
 import os
 import numpy as np
 
-#LABEL_MAP = {'bow': 0, 'boxing': 1, 'draw_o': 2, 'stand': 3}
-LABEL_MAP = {'cut': 0, 'grip': 1, 'draw_o': 2}
-INV_LABEL_MAP = {v: k for k, v in LABEL_MAP.items()}
+from config import LABEL_MAP, INV_LABEL_MAP_EN as INV_LABEL_MAP
 
-def load_dataset(dataset_dir="dataset/dataset_2026_6_10"):
-    if not os.path.exists(dataset_dir):
-        raise FileNotFoundError(f"Dataset directory '{dataset_dir}' not found.")
+def _load_folder(folder_path):
+    if not os.path.exists(folder_path):
+        raise FileNotFoundError(f"Folder directory '{folder_path}' not found.")
     
-    npz_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith('.npz')])
+    npz_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.npz')])
     X_dict = {}
     
-    print(f"Loading dataset from {dataset_dir}...")
+    print(f"Loading data from {folder_path}...")
     for filename in npz_files:
-        file_path = os.path.join(dataset_dir, filename)
+        file_path = os.path.join(folder_path, filename)
         
         # Robust label extraction: find index before the 8-digit date string starting with '202'
         parts = filename.split('_')
@@ -43,32 +41,84 @@ def load_dataset(dataset_dir="dataset/dataset_2026_6_10"):
     X_by_label = {}
     for idx in X_dict:
         X_by_label[idx] = np.concatenate(X_dict[idx], axis=0)
-        print(f"  Class '{INV_LABEL_MAP[idx]}': {X_by_label[idx].shape[0]} samples")
+        print(f"  Class '{INV_LABEL_MAP.get(idx, str(idx))}': {X_by_label[idx].shape[0]} samples")
         
     return X_by_label
 
+def load_dataset(dataset_dir="dataset/dataset_2026_7_19_2"):
+    if not os.path.exists(dataset_dir):
+        raise FileNotFoundError(f"Dataset directory '{dataset_dir}' not found.")
+    
+    # Check if 'train' and 'test' subdirectories exist
+    train_path = os.path.join(dataset_dir, "train")
+    test_path = os.path.join(dataset_dir, "test")
+    
+    if os.path.isdir(train_path) and os.path.isdir(test_path):
+        print(f"Detected train/test split directories in {dataset_dir}")
+        train_data = _load_folder(train_path)
+        test_data = _load_folder(test_path)
+        return {
+            "train": train_data,
+            "test": test_data
+        }
+    else:
+        # Fallback to loading the directory directly (the old behavior)
+        return _load_folder(dataset_dir)
+
 def split_80_20(X_by_label):
-    x_train_list, x_test_list = [], []
-    y_train_list, y_test_list = [], []
-    
-    print("\nSplitting dataset (80% train, 20% test sequentially)...")
-    for idx in sorted(X_by_label.keys()):
-        X = X_by_label[idx]
-        n_samples = len(X)
-        split_point = int(n_samples * 0.3)
+    if isinstance(X_by_label, dict) and "train" in X_by_label and "test" in X_by_label:
+        train_dict = X_by_label["train"]
+        test_dict = X_by_label["test"]
         
-        x_train_list.append(X[:split_point])
-        x_test_list.append(X[split_point:])
-        y_train_list.append(np.full(split_point, idx, dtype=np.int64))
-        y_test_list.append(np.full(n_samples - split_point, idx, dtype=np.int64))
-        print(f"  Class '{INV_LABEL_MAP[idx]}': Train={split_point}, Test={n_samples - split_point}")
+        x_train_list, x_test_list = [], []
+        y_train_list, y_test_list = [], []
         
-    x_train = np.concatenate(x_train_list, axis=0)
-    x_test = np.concatenate(x_test_list, axis=0)
-    y_train = np.concatenate(y_train_list, axis=0)
-    y_test = np.concatenate(y_test_list, axis=0)
-    
-    return x_train, x_test, y_train, y_test
+        print("\nAssembling pre-split dataset...")
+        # Merge all class indices from both train and test
+        all_classes = sorted(list(set(train_dict.keys()) | set(test_dict.keys())))
+        for idx in all_classes:
+            train_samples = train_dict.get(idx, np.empty((0,)))
+            test_samples = test_dict.get(idx, np.empty((0,)))
+            
+            if len(train_samples) > 0:
+                x_train_list.append(train_samples)
+                y_train_list.append(np.full(len(train_samples), idx, dtype=np.int64))
+            if len(test_samples) > 0:
+                x_test_list.append(test_samples)
+                y_test_list.append(np.full(len(test_samples), idx, dtype=np.int64))
+                
+            print(f"  Class '{INV_LABEL_MAP.get(idx, str(idx))}': Train={len(train_samples)}, Test={len(test_samples)}")
+            
+        x_train = np.concatenate(x_train_list, axis=0) if x_train_list else np.empty((0,))
+        x_test = np.concatenate(x_test_list, axis=0) if x_test_list else np.empty((0,))
+        y_train = np.concatenate(y_train_list, axis=0) if y_train_list else np.empty((0,))
+        y_test = np.concatenate(y_test_list, axis=0) if y_test_list else np.empty((0,))
+        
+        return x_train, x_test, y_train, y_test
+    else:
+        # Fallback to the original split behavior if needed
+        x_train_list, x_test_list = [], []
+        y_train_list, y_test_list = [], []
+        
+        print("\nSplitting dataset (80% train, 20% test sequentially)...")
+        for idx in sorted(X_by_label.keys()):
+            X = X_by_label[idx]
+            n_samples = len(X)
+            split_point = int(n_samples * 0.5)
+            
+            x_train_list.append(X[:split_point])
+            x_test_list.append(X[split_point:])
+            y_train_list.append(np.full(split_point, idx, dtype=np.int64))
+            y_test_list.append(np.full(n_samples - split_point, idx, dtype=np.int64))
+            print(f"  Class '{INV_LABEL_MAP.get(idx, str(idx))}': Train={split_point}, Test={n_samples - split_point}")
+            
+        x_train = np.concatenate(x_train_list, axis=0)
+        x_test = np.concatenate(x_test_list, axis=0)
+        y_train = np.concatenate(y_train_list, axis=0)
+        y_test = np.concatenate(y_test_list, axis=0)
+        
+        return x_train, x_test, y_train, y_test
+
 
 def preprocess_csi_fusion(X_complex, eps=2.0):
     N = len(X_complex)
@@ -104,7 +154,7 @@ def preprocess_csi_fusion(X_complex, eps=2.0):
     X_combined = np.concatenate([X_amp_norm, X_phase_norm], axis=2)
     return X_combined
 
-def preprocess_csi_amp_only(X_complex, eps=2.0):
+def preprocess_csi_amp_only(X_complex, eps=3.0):
     N = len(X_complex)
     X_amp = np.abs(X_complex)
     X_amp_norm = np.zeros_like(X_amp)

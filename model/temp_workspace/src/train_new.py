@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import dataset
 import models
+import config
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -33,7 +34,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 class CSITransformer(nn.Module):
-    def __init__(self, input_dim=228, d_model=128, nhead=4, num_layers=2, num_classes=4):
+    def __init__(self, input_dim=228, d_model=128, nhead=4, num_layers=2, num_classes=len(config.LABEL_MAP)):
         super(CSITransformer, self).__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
@@ -62,13 +63,16 @@ class CSITransformer(nn.Module):
         return self.classifier(x)
 
 # ----------------- Training Pipeline -----------------
-def train_configuration(config_name, model, train_loader, test_loader, epochs, device):
+def train_configuration(config_name, model, train_loader, test_loader, epochs, device, num_classes=None):
+    if num_classes is None:
+        num_classes = len(config.LABEL_MAP)
     print(f"\n================ Training Configuration: {config_name} ================")
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     best_test_acc = 0.0
+    best_weights = None
     history = {'train_loss': [], 'train_acc': [], 'test_acc': []}
     
     for epoch in range(epochs):
@@ -92,6 +96,9 @@ def train_configuration(config_name, model, train_loader, test_loader, epochs, d
         # Evaluation
         model.eval()
         test_correct, test_total = 0, 0
+        class_correct = [0] * num_classes
+        class_total = [0] * num_classes
+        
         with torch.no_grad():
             for inputs, labels in test_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
@@ -99,6 +106,11 @@ def train_configuration(config_name, model, train_loader, test_loader, epochs, d
                 _, predicted = torch.max(outputs.data, 1)
                 test_total += labels.size(0)
                 test_correct += (predicted == labels).sum().item()
+                
+                for c in range(num_classes):
+                    mask = (labels == c)
+                    class_total[c] += mask.sum().item()
+                    class_correct[c] += ((predicted == labels) & mask).sum().item()
                 
         test_acc = 100 * test_correct / test_total
         avg_loss = loss_val / len(train_loader)
@@ -109,11 +121,46 @@ def train_configuration(config_name, model, train_loader, test_loader, epochs, d
         
         if test_acc > best_test_acc:
             best_test_acc = test_acc
+            best_weights = model.state_dict().copy()
             
-        print(f"Epoch {epoch+1:02d}/{epochs:02d}: Loss={avg_loss:.4f}, Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%")
+        class_accs = []
+        for c in range(num_classes):
+            if class_total[c] > 0:
+                acc = 100 * class_correct[c] / class_total[c]
+                class_accs.append(f"Class {c}={acc:.2f}%")
+            else:
+                class_accs.append(f"Class {c}=N/A")
         
+        print(f"Epoch {epoch+1:02d}/{epochs:02d}: Loss={avg_loss:.4f}, Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}% | {' | '.join(class_accs)}")
+        
+    # Evaluate best model weights on test set to get final per-class accuracies
+    model.load_state_dict(best_weights)
+    model.eval()
+    best_class_correct = [0] * num_classes
+    best_class_total = [0] * num_classes
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+            for c in range(num_classes):
+                mask = (labels == c)
+                best_class_total[c] += mask.sum().item()
+                best_class_correct[c] += ((predicted == labels) & mask).sum().item()
+                
     print(f"Finished {config_name}! Best Test Accuracy: {best_test_acc:.2f}%")
-    return best_test_acc, history
+    print(f"\n--- Final Best Per-Class Accuracy Summary for {config_name} ---")
+    best_class_accuracies = {}
+    for c in range(num_classes):
+        if best_class_total[c] > 0:
+            acc = 100 * best_class_correct[c] / best_class_total[c]
+            best_class_accuracies[c] = acc
+            print(f"  Class {c}: {best_class_correct[c]}/{best_class_total[c]} = {acc:.2f}%")
+        else:
+            best_class_accuracies[c] = 0.0
+            print(f"  Class {c}: 0/0 = N/A")
+            
+    return best_test_acc, best_weights, history, best_class_accuracies
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,7 +169,9 @@ def main():
     # Establish organized directories
     src_dir = os.path.dirname(os.path.abspath(__file__))
     workspace_dir = os.path.dirname(src_dir)
+    models_dir = os.path.join(workspace_dir, "models")
     plots_dir = os.path.join(workspace_dir, "plots")
+    os.makedirs(models_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
     
     # 1. Load raw dataset using dataset.py
@@ -141,68 +190,89 @@ def main():
     train_loader = DataLoader(TensorDataset(x_train_t, torch.tensor(y_train)), batch_size=64, shuffle=True)
     test_loader = DataLoader(TensorDataset(x_test_t, torch.tensor(y_test)), batch_size=64, shuffle=False)
     
-    epochs = 20
+    epochs = 30
     all_results = {}
+    num_classes = len(config.LABEL_MAP)
     
     # =========================================================================
     # Config 1: Simple MLP (Fused Amp + Phase)
     # =========================================================================
-    model_mlp = models.SimpleMLP(input_dim=11400, num_classes=4).to(device)
-    best_acc_mlp, history_mlp = train_configuration(
-        "MLP (Amp + Phase)", model_mlp, train_loader, test_loader, epochs=epochs, device=device
+    model_mlp = models.SimpleMLP(input_dim=11400, num_classes=num_classes).to(device)
+    best_acc_mlp, weights_mlp, history_mlp, class_accs_mlp = train_configuration(
+        "MLP", model_mlp, train_loader, test_loader, epochs=epochs, device=device, num_classes=num_classes
     )
-    all_results["MLP"] = (best_acc_mlp, history_mlp)
+    all_results["MLP"] = (best_acc_mlp, class_accs_mlp)
+    torch.save(weights_mlp, os.path.join(models_dir, "best_new_mlp.pth"))
+    print(f"Saved MLP model to {os.path.join(models_dir, 'best_new_mlp.pth')}")
     
     # =========================================================================
     # Config 2: CNN1D (Fused Amp + Phase)
     # =========================================================================
-    model_cnn = models.Advanced1DCNN(n_subcarriers=228, num_classes=4).to(device)
-    best_acc_cnn, history_cnn = train_configuration(
-        "CNN1D (Amp + Phase)", model_cnn, train_loader, test_loader, epochs=epochs, device=device
+    model_cnn = models.Advanced1DCNN(n_subcarriers=228, num_classes=num_classes).to(device)
+    best_acc_cnn, weights_cnn, history_cnn, class_accs_cnn = train_configuration(
+        "CNN1D", model_cnn, train_loader, test_loader, epochs=epochs, device=device, num_classes=num_classes
     )
-    all_results["CNN1D"] = (best_acc_cnn, history_cnn)
+    all_results["CNN1D"] = (best_acc_cnn, class_accs_cnn)
+    torch.save(weights_cnn, os.path.join(models_dir, "best_optimized_cnn.pth"))
+    print(f"Saved CNN1D model to {os.path.join(models_dir, 'best_optimized_cnn.pth')}")
     
     # =========================================================================
-    # Config 3: LSTM (Fused Amp + Phase)
+    # Config 3: ResNet1D (Fused Amp + Phase)
     # =========================================================================
-    model_lstm = models.LSTMGestureClassifier(input_dim=228, num_classes=4).to(device)
-    best_acc_lstm, history_lstm = train_configuration(
-        "LSTM (Amp + Phase)", model_lstm, train_loader, test_loader, epochs=epochs, device=device
+    model_resnet = models.ResNet1DGesture(n_subcarriers=228, num_classes=num_classes).to(device)
+    best_acc_resnet, weights_resnet, history_resnet, class_accs_resnet = train_configuration(
+        "ResNet1D", model_resnet, train_loader, test_loader, epochs=epochs, device=device, num_classes=num_classes
     )
-    all_results["LSTM"] = (best_acc_lstm, history_lstm)
+    all_results["ResNet1D"] = (best_acc_resnet, class_accs_resnet)
+    torch.save(weights_resnet, os.path.join(models_dir, "best_new_resnet.pth"))
+    print(f"Saved ResNet1D model to {os.path.join(models_dir, 'best_new_resnet.pth')}")
     
     # =========================================================================
-    # Config 4: Transformer (Fused Amp + Phase)
+    # Config 4: CNN1D + GRU (Fused Amp + Phase)
     # =========================================================================
-    model_transformer = CSITransformer(input_dim=228, d_model=128, nhead=4, num_layers=2, num_classes=4).to(device)
-    best_acc_trans, history_trans = train_configuration(
-        "Transformer (Amp + Phase)", model_transformer, train_loader, test_loader, epochs=epochs, device=device
+    model_cnngru = models.CNN_GRU_Classifier(n_subcarriers=228, num_classes=num_classes).to(device)
+    best_acc_cnngru, weights_cnngru, history_cnngru, class_accs_cnngru = train_configuration(
+        "CNN1D-GRU", model_cnngru, train_loader, test_loader, epochs=epochs, device=device, num_classes=num_classes
     )
-    all_results["Transformer"] = (best_acc_trans, history_trans)
+    all_results["CNN1D-GRU"] = (best_acc_cnngru, class_accs_cnngru)
+    torch.save(weights_cnngru, os.path.join(models_dir, "best_new_cnngru.pth"))
+    print(f"Saved CNN1D-GRU model to {os.path.join(models_dir, 'best_new_cnngru.pth')}")
     
-    # 3. Generate Evaluation Plot (Test Accuracy)
-    plt.figure(figsize=(10, 6))
-    for name, (best_acc, history) in all_results.items():
-        plt.plot(range(1, epochs + 1), history['test_acc'], marker='o', label=f"{name} (Best: {best_acc:.2f}%)")
-        
-    plt.title('Test Accuracy Comparison across Architectures (Amplitude + Phase Fusion)')
-    plt.xlabel('Epoch')
-    plt.ylabel('Test Accuracy (%)')
-    plt.grid(True)
-    plt.legend(loc='lower right')
-    plt.tight_layout()
-    
-    comparison_filename = "comparison_new.png"
-    plt.savefig(os.path.join(plots_dir, comparison_filename))
-    plt.close()
-    print(f"\nSaved overall comparison plot to {comparison_filename} inside plots/ directory.")
-    
-    # 4. Print final summary table
-    print("\n================ Final Performance Summary ================")
-    print(f"{'Architecture':15s} | {'Best Test Accuracy (%)':22s}")
-    print("-" * 42)
-    for name, (acc, _) in all_results.items():
-        print(f"{name:15s} | {acc:22.2f}%")
+    # =========================================================================
+    # Config 5: CSITransformer (Fused Amp + Phase)
+    # =========================================================================
+    model_trans = CSITransformer(input_dim=228, num_classes=num_classes).to(device)
+    best_acc_trans, weights_trans, history_trans, class_accs_trans = train_configuration(
+        "CSITransformer", model_trans, train_loader, test_loader, epochs=epochs, device=device, num_classes=num_classes
+    )
+    all_results["CSITransformer"] = (best_acc_trans, class_accs_trans)
+    torch.save(weights_trans, os.path.join(models_dir, "best_new_transformer.pth"))
+    print(f"Saved CSITransformer model to {os.path.join(models_dir, 'best_new_transformer.pth')}")
 
+    # =========================================================================
+    # Config 6: CNN2D (Fused Amp + Phase)
+    # =========================================================================
+    model_cnn2d = models.SpectrogramCNN2D(in_freq=228, in_time_feat=50, num_classes=num_classes).to(device)
+    best_acc_cnn2d, weights_cnn2d, history_cnn2d, class_accs_cnn2d = train_configuration(
+        "CNN2D", model_cnn2d, train_loader, test_loader, epochs=epochs, device=device, num_classes=num_classes
+    )
+    all_results["CNN2D"] = (best_acc_cnn2d, class_accs_cnn2d)
+    torch.save(weights_cnn2d, os.path.join(models_dir, "best_new_cnn2d.pth"))
+    print(f"Saved CNN2D model to {os.path.join(models_dir, 'best_new_cnn2d.pth')}")
+
+    # =========================================================================
+    # Final Summary Table Printing
+    # =========================================================================
+    print("\n" + "=" * 110)
+    print("                                  WIFI CSI MODEL COMPARISON SUMMARY")
+    print("=" * 110)
+    header = f"{'Model Name':<16} | {'Overall Acc':<12} | " + " | ".join([f"Class {c} ({config.INV_LABEL_MAP_EN[c]})" for c in range(num_classes)])
+    print(header)
+    print("-" * 110)
+    for model_name, (overall_acc, class_accs) in all_results.items():
+        class_str = " | ".join([f"{class_accs[c]:6.2f}%" for c in range(num_classes)])
+        print(f"{model_name:<16} | {overall_acc:>10.2f}% | {class_str}")
+    print("=" * 110)
+ 
 if __name__ == '__main__':
     main()
